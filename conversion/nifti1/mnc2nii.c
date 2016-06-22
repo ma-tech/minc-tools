@@ -2,14 +2,15 @@
 #include "config.h"
 #endif
 
-#include <minc2.h>
+#include <minc.h>
 #include <ParseArgv.h>
+#include <volume_io.h>
 
 #include "restructure.h"
 
 #include "nifti1_io.h"
 
-#include "nifti1_local.h"       /* Our local definitions */
+#define MAX_NII_DIMS 8
 
 /* This list is in the order in which dimension lengths and sample
  * widths are stored in the NIfTI-1 structure.
@@ -25,17 +26,34 @@ static const char *dimnames[MAX_NII_DIMS] = {
     NULL
 };
 
+/* Map dimension index from the actual mapping of the data array to the 
+ * "internal header array order".
+ *
+ * In other words, NIfTI-1 seems to store the lengths of dimensions in this
+ * order: X, Y, Z, T, V in the dim[8] entry.
+ * But data is actually stored with the vector dimension varying _slowest_,
+ * with the X dimension varying _fastest_, i.e. as if it were a  C array
+ * declared array[V][T][Z][Y][X];
+ */
+
+static const int dimmap[MAX_NII_DIMS] = {
+    4, 3, 2, 1, 0, -1, -1, -1
+};
+
+static const char *mnc_spatial_names[VIO_N_DIMENSIONS] = {
+  MIxspace, MIyspace, MIzspace
+};
 
 void test_xform(mat44 m, int i, int j, int k)
 {
     double x, y, z;
     
-    x = m.m[DIM_X][DIM_I] * i + m.m[DIM_X][DIM_J] * j + m.m[DIM_X][DIM_K] * k 
-        + m.m[DIM_X][3];
-    y = m.m[DIM_Y][DIM_I] * i + m.m[DIM_Y][DIM_J] * j + m.m[DIM_Y][DIM_K] * k 
-        + m.m[DIM_Y][3];
-    z = m.m[DIM_Z][DIM_I] * i + m.m[DIM_Z][DIM_J] * j + m.m[DIM_Z][DIM_K] * k 
-        + m.m[DIM_Z][3];
+    x = m.m[VIO_X][0] * i + m.m[VIO_X][1] * j + m.m[VIO_X][2] * k 
+        + m.m[VIO_X][3];
+    y = m.m[VIO_Y][0] * i + m.m[VIO_Y][1] * j + m.m[VIO_Y][2] * k 
+        + m.m[VIO_Y][3];
+    z = m.m[VIO_Z][0] * i + m.m[VIO_Z][1] * j + m.m[VIO_Z][2] * k 
+        + m.m[VIO_Z][3];
 
     printf("%d %d %d => ", i, j, k);
     printf("%f %f %f\n", x, y, z);
@@ -115,7 +133,7 @@ init_nifti_header(nifti_image *nii_ptr)
     nii_ptr->xyz_units = NIFTI_UNITS_MM; /* Default spatial units */
     nii_ptr->time_units = NIFTI_UNITS_SEC; /* Default time units */
 
-    nii_ptr->nifti_type = FT_ANALYZE;
+    nii_ptr->nifti_type = NIFTI_FTYPE_ANALYZE;
     nii_ptr->intent_code = 0;
     nii_ptr->intent_p1 = 0.0;
     nii_ptr->intent_p2 = 0.0;
@@ -199,6 +217,13 @@ main(int argc, char **argv)
     char *str_ptr;              /* Generic ASCIZ string pointer */
     int r;                      /* Result code. */
     static int vflag = 0;       /* Verbose flag (default is quiet) */
+    int do_norm = 0;
+    VIO_Real start[VIO_N_DIMENSIONS];
+    VIO_Real step[VIO_N_DIMENSIONS];
+    VIO_Real dircos[VIO_N_DIMENSIONS][VIO_N_DIMENSIONS];
+    int spatial_axes[VIO_N_DIMENSIONS];
+    VIO_General_transform transform;
+    VIO_Transform *linear_transform;
 
     static ArgvInfo argTable[] = {
         {NULL, ARGV_HELP, NULL, NULL,
@@ -219,16 +244,16 @@ main(int argc, char **argv)
          "Write integer voxel data in unsigned format."},
         {NULL, ARGV_HELP, NULL, NULL,
          "Output file format specification"},
-        {"-dual", ARGV_CONSTANT, (char *)FT_NIFTI_DUAL, 
+        {"-dual", ARGV_CONSTANT, (char *)NIFTI_FTYPE_NIFTI1_2, 
          (char *)&nifti_filetype,
          "Write NIfTI-1 two-file format (.img and .hdr)"},
-        {"-ASCII", ARGV_CONSTANT, (char *)FT_NIFTI_ASCII, 
+        {"-ASCII", ARGV_CONSTANT, (char *)NIFTI_FTYPE_ASCII, 
          (char *)&nifti_filetype,
          "Write NIfTI-1 ASCII header format (.nia)"},
-        {"-nii", ARGV_CONSTANT, (char *)FT_NIFTI_SINGLE, 
+        {"-nii", ARGV_CONSTANT, (char *)NIFTI_FTYPE_NIFTI1_1, 
          (char *)&nifti_filetype,
          "Write NIfTI-1 one-file format (.nii)"},
-        {"-analyze", ARGV_CONSTANT, (char *)FT_ANALYZE, 
+        {"-analyze", ARGV_CONSTANT, (char *)NIFTI_FTYPE_ANALYZE, 
          (char *)&nifti_filetype,
          "Write an Analyze two-file format file (.img and .hdr)"},
         {NULL, ARGV_HELP, NULL, NULL,
@@ -246,7 +271,7 @@ main(int argc, char **argv)
 
     /* Default NIfTI file type is "NII", single binary file
      */
-    nifti_filetype = FT_UNSPECIFIED;
+    nifti_filetype = -1;
     nifti_datatype = DT_UNKNOWN;
 
     if (ParseArgv(&argc, argv, argTable, 0) || (argc < 2)) {
@@ -306,21 +331,21 @@ main(int argc, char **argv)
              * extension for the selected output format.
              */
             if (!strcmp(str_ptr, ".nii")) {
-                if (nifti_filetype == FT_UNSPECIFIED) {
-                    nifti_filetype = FT_NIFTI_SINGLE;
+                if (nifti_filetype < 0) {
+                    nifti_filetype = NIFTI_FTYPE_NIFTI1_1;
                 }
                 *str_ptr = '\0';
             }
             else if (!strcmp(str_ptr, ".img") || 
                      !strcmp(str_ptr, ".hdr")) {
-                if (nifti_filetype == FT_UNSPECIFIED) {
-                    nifti_filetype = FT_NIFTI_DUAL;
+                if (nifti_filetype < 0) {
+                    nifti_filetype = NIFTI_FTYPE_NIFTI1_2;
                 }
                 *str_ptr = '\0';
             }
             else if (!strcmp(str_ptr, ".nia")) {
-                if (nifti_filetype == FT_UNSPECIFIED) {
-                    nifti_filetype = FT_NIFTI_ASCII;
+                if (nifti_filetype < 0) {
+                    nifti_filetype = NIFTI_FTYPE_ASCII;
                 }
                 *str_ptr = '\0';
             }
@@ -362,6 +387,23 @@ main(int argc, char **argv)
         return (-1);
     }
 
+    for (i = 0; i < mnc_ndims; i++)
+    {
+        char name[1024];
+        long tmp;
+
+        ncdiminq(mnc_fd, mnc_dimids[i], name, &tmp);
+        if (!strcmp(name, "xspace")) {
+          spatial_axes[VIO_X] = i;
+        }
+        else if (!strcmp(name, "yspace")) {
+          spatial_axes[VIO_Y] = i;
+        }
+        else if (!strcmp(name, "zspace")) {
+          spatial_axes[VIO_Z] = i;
+        }
+    }
+
     /* Initialize the NIfTI structure 
      */
     nii_ptr = &nii_rec;
@@ -377,7 +419,7 @@ main(int argc, char **argv)
     for (i = 0; i < argc; i++) {
         char *arg_ptr = argv[i];
 
-        if ((str_ptr - nii_ptr->descrip) >= MAX_NII_DESCRIP) {
+        if ((str_ptr - nii_ptr->descrip) >= sizeof(nii_ptr->descrip)) {
             break;
         }
 
@@ -386,7 +428,7 @@ main(int argc, char **argv)
         }
 
         while (*arg_ptr != '\0' && 
-               (str_ptr - nii_ptr->descrip) < MAX_NII_DESCRIP) {
+               (str_ptr - nii_ptr->descrip) < sizeof(nii_ptr->descrip)) {
             *str_ptr++ = *arg_ptr++;
         }
         *str_ptr = '\0';
@@ -398,19 +440,19 @@ main(int argc, char **argv)
     strcpy(nii_ptr->iname, out_str);
 
     switch (nifti_filetype) {
-    case FT_ANALYZE:
+    case NIFTI_FTYPE_ANALYZE:
         strcat(nii_ptr->fname, ".hdr");
         strcat(nii_ptr->iname, ".img");
         break;
-    case FT_NIFTI_SINGLE:
+    case NIFTI_FTYPE_NIFTI1_1:
         strcat(nii_ptr->fname, ".nii");
         strcat(nii_ptr->iname, ".nii");
         break;
-    case FT_NIFTI_DUAL:
+    case NIFTI_FTYPE_NIFTI1_2:
         strcat(nii_ptr->fname, ".hdr");
         strcat(nii_ptr->iname, ".img");
         break;
-    case FT_NIFTI_ASCII:
+    case NIFTI_FTYPE_ASCII:
         strcat(nii_ptr->fname, ".nia");
         strcat(nii_ptr->iname, ".nia");
         break;
@@ -451,7 +493,7 @@ main(int argc, char **argv)
     total_valid_range = input_valid_range[1] - input_valid_range[0];
     total_real_range = real_range[1] - real_range[0];
 
-    if ((output_valid_range[1] - output_valid_range[0]) > total_valid_range) {
+    if ((output_valid_range[1] - output_valid_range[0]) >= total_valid_range) {
         /* Empirically, forcing the valid range to be the nearest power
          * of two greater than the existing valid range seems to improve
          * the behavior of the conversion. This is at least in part because
@@ -523,9 +565,14 @@ main(int argc, char **argv)
                 return (-1);
             }
         }
+        //do_norm = TRUE;
     }
     else {
+      if (vflag) printf("Resetting output range.\n");
         nifti_slope = 0.0;
+        output_valid_range[0] = real_range[0];
+        output_valid_range[1] = real_range[1];
+        do_norm = FALSE;
     }
 
     nii_ptr->scl_slope = nifti_slope;
@@ -613,68 +660,49 @@ main(int argc, char **argv)
 
     nii_ptr->nifti_type = nifti_filetype;
 
-    /* Load the direction_cosines and start values into the NIfTI-1 
-     * sform structure.
-     *
-     */
-    for (i = 0; i < MAX_SPACE_DIMS; i++) {
+    for (i = 0; i < VIO_N_DIMENSIONS; i++) {
         int id = ncvarid(mnc_fd, mnc_spatial_names[i]);
-        double start;
-        double step;
-        double dircos[MAX_SPACE_DIMS];
         int tmp;
+        int axis = spatial_axes[i];
 
         if (id < 0) {
             continue;
         }
 
         /* Set default values */
-        start = 0.0;
-        step = 1.0;
-        dircos[DIM_X] = dircos[DIM_Y] = dircos[DIM_Z] = 0.0;
-        dircos[i] = 1.0;
+        start[axis] = 0.0;
+        step[axis] = 1.0;
+        dircos[axis][VIO_X] = dircos[i][VIO_Y] = dircos[i][VIO_Z] = 0.0;
+        dircos[axis][axis] = 1.0;
 
-        miattget(mnc_fd, id, MIstart, NC_DOUBLE, 1, &start, &tmp);
-        miattget(mnc_fd, id, MIstep, NC_DOUBLE, 1, &step, &tmp);
-        miattget(mnc_fd, id, MIdirection_cosines, NC_DOUBLE, MAX_SPACE_DIMS, 
-                 dircos, &tmp);
-        ncdiminq(mnc_fd, ncdimid(mnc_fd, mnc_spatial_names[i]), NULL, 
-                 &mnc_dlen);
-
-        if (step < 0) {
-            step = -step;
-            start = start - step * (mnc_dlen - 1);
-        }
-
-        nii_ptr->sto_xyz.m[0][i] = step * dircos[0];
-        nii_ptr->sto_xyz.m[1][i] = step * dircos[1];
-        nii_ptr->sto_xyz.m[2][i] = step * dircos[2];
-
-        nii_ptr->sto_xyz.m[0][3] += start * dircos[0];
-        nii_ptr->sto_xyz.m[1][3] += start * dircos[1];
-        nii_ptr->sto_xyz.m[2][3] += start * dircos[2];
-
+        miattget(mnc_fd, id, MIstart, NC_DOUBLE, 1, &start[axis], &tmp);
+        miattget(mnc_fd, id, MIstep, NC_DOUBLE, 1, &step[axis], &tmp);
+        miattget(mnc_fd, id, MIdirection_cosines, NC_DOUBLE, VIO_N_DIMENSIONS,
+                 &dircos[axis], &tmp);
         miattgetstr(mnc_fd, id, MIspacetype, sizeof(att_str), att_str);
-
         /* Try to set the S-transform code correctly.
          */
         if (!strcmp(att_str, MI_TALAIRACH)) {
-            nii_ptr->sform_code = NIFTI_XFORM_TALAIRACH;
+          nii_ptr->sform_code = NIFTI_XFORM_TALAIRACH;
         }
         else if (!strcmp(att_str, MI_CALLOSAL)) {
-            /* TODO: Not clear what do do here... */
-            nii_ptr->sform_code = NIFTI_XFORM_SCANNER_ANAT;
+          /* TODO: Not clear what do do here... */
+          nii_ptr->sform_code = NIFTI_XFORM_SCANNER_ANAT;
         }
         else {                  /* MI_NATIVE or unknown */
-            nii_ptr->sform_code = NIFTI_XFORM_SCANNER_ANAT;
+          nii_ptr->sform_code = NIFTI_XFORM_SCANNER_ANAT;
         }
     }
 
-    /* So the last row is right... */
-    nii_ptr->sto_xyz.m[3][0] = 0.0;
-    nii_ptr->sto_xyz.m[3][1] = 0.0;
-    nii_ptr->sto_xyz.m[3][2] = 0.0;
-    nii_ptr->sto_xyz.m[3][3] = 1.0;
+    compute_world_transform(spatial_axes, step, dircos, start, &transform);
+
+    linear_transform = get_linear_transform_ptr( &transform );
+
+    for (i = 0; i < 4; i++) {
+      for (j = 0; j < 4; j++) {
+        nii_ptr->sto_xyz.m[i][j] = Transform_elem(*linear_transform, i, j);
+      }
+    }
 
     nii_ptr->sto_ijk = nifti_mat44_inverse(nii_ptr->sto_xyz);
 
@@ -694,17 +722,6 @@ main(int argc, char **argv)
         return (-1);
     }
 
-    mnc_icv = miicv_create();
-    miicv_setint(mnc_icv, MI_ICV_TYPE, mnc_type);
-    miicv_setstr(mnc_icv, MI_ICV_SIGN, (mnc_signed) ? MI_SIGNED : MI_UNSIGNED);
-    miicv_setdbl(mnc_icv, MI_ICV_VALID_MAX, output_valid_range[1]);
-    miicv_setdbl(mnc_icv, MI_ICV_VALID_MIN, output_valid_range[0]);
-    miicv_setdbl(mnc_icv, MI_ICV_IMAGE_MAX, real_range[1]);
-    miicv_setdbl(mnc_icv, MI_ICV_IMAGE_MIN, real_range[0]);
-    miicv_setdbl(mnc_icv, MI_ICV_DO_NORM, TRUE);
-    miicv_setdbl(mnc_icv, MI_ICV_USER_NORM, TRUE);
-
-    miicv_attach(mnc_icv, mnc_fd, mnc_vid);
 
     /* Read in the entire hyperslab from the file.
      */
@@ -713,18 +730,37 @@ main(int argc, char **argv)
         mnc_start[i] = 0;
     }
 
-    r = miicv_get(mnc_icv, mnc_start, mnc_count, nii_ptr->data);
-    if (r < 0) {
+    if (do_norm) {
+      mnc_icv = miicv_create();
+      miicv_setint(mnc_icv, MI_ICV_TYPE, mnc_type);
+      miicv_setstr(mnc_icv, MI_ICV_SIGN, (mnc_signed) ? MI_SIGNED : MI_UNSIGNED);
+      miicv_setdbl(mnc_icv, MI_ICV_VALID_MAX, output_valid_range[1]);
+      miicv_setdbl(mnc_icv, MI_ICV_VALID_MIN, output_valid_range[0]);
+      miicv_setdbl(mnc_icv, MI_ICV_IMAGE_MAX, real_range[1]);
+      miicv_setdbl(mnc_icv, MI_ICV_IMAGE_MIN, real_range[0]);
+      miicv_setdbl(mnc_icv, MI_ICV_DO_NORM, TRUE);
+      miicv_setdbl(mnc_icv, MI_ICV_USER_NORM, TRUE);
+
+      miicv_attach(mnc_icv, mnc_fd, mnc_vid);
+
+      r = miicv_get(mnc_icv, mnc_start, mnc_count, nii_ptr->data);
+      if (r < 0) {
         fprintf(stderr, "Read error\n");
         return (-1);
+      }
+
+      /* Shut down the MINC stuff now that it has done its work. 
+       */
+      miicv_detach(mnc_icv);
+      miicv_free(mnc_icv);
+      miclose(mnc_fd);
     }
-
-    /* Shut down the MINC stuff now that it has done its work. 
-     */
-    miicv_detach(mnc_icv);
-    miicv_free(mnc_icv);
-    miclose(mnc_fd);
-
+    else {
+      mivarget(mnc_fd, mnc_vid, mnc_start, mnc_count, mnc_type, 
+               (mnc_signed) ? MI_SIGNED : MI_UNSIGNED,
+               nii_ptr->data);
+    }
+      
     if (vflag) {
         /* Debugging stuff - just to check the contents of these arrays.
          */
@@ -738,12 +774,14 @@ main(int argc, char **argv)
 
     /* Rearrange the data to correspond to the NIfTI dimension ordering.
      */
+#if 0
     restructure_array(nii_ndims,
                       nii_ptr->data,
                       nii_lens,
                       nii_ptr->nbyper,
                       nii_map,
                       nii_dir);
+#endif
 
     if (vflag) {
         /* More debugging stuff - check coordinate transform.
